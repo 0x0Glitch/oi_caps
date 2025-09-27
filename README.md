@@ -1,20 +1,28 @@
-# HIP-3 Open Interest Cap Manager
+# HIP-3 OpenInterest Cap Manager
 
-Production-ready tool for managing Open Interest caps on Hyperliquid HIP-3 (builder-deployed) perpetual markets. Uses EOA L1 signing with proper constraint validation according to official Hyperliquid specifications.
+Production-ready tool for managing OpenInterest caps on Hyperliquid HIP-3 (builder-deployed) perpetual markets. Uses EOA L1 signing with proper constraint validation according to official Hyperliquid specifications.
 
-## ✨ Features
+## 🔥 Key Features
 
-- **🔒 Production Security**: EOA L1 signing with EIP-712, no agent required
+- **⚡ Native SDK Integration**: Uses hyperliquid-python-sdk's native L1 signing
+- **🛡️ EOA Signing**: Proper L1 action signing with EIP-712 domain verification  
+- **🎯 HIP-3 Specific**: Handles `perpDeploy` actions with `setOpenInterestCaps`
 - **📊 Smart Validation**: Enforces HIP-3 constraints (`max($1M, 0.5 × current OI)`)
 - **🛡️ Safety First**: Comprehensive dry-run mode and error handling
+- **🔒 Critical Safety Checks**: 
+  - New cap can never be less than current OpenInterest
+  - Configurable maximum cap change percentage (default: 200%)
+  - First-time cap setting support for new assets
 - **📈 Precision Math**: Decimal arithmetic throughout, no float precision loss
 - **🔍 Full Verification**: Reads back changed caps to confirm updates
 - **📝 Detailed Logging**: Clear progress tracking and helpful error hints
+- **🚫 Null Field Protection**: Omits null vaultAddress/expiresAfter from payload
 
 ## 🚀 Quick Start
 
 ### 1. Installation
 
+{{ ... }}
 #### Option A: Standalone Installation (Recommended for Production)
 ```bash
 # Download just the oi_caps directory
