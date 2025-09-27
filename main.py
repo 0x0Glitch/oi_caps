@@ -28,10 +28,7 @@ import sys
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple, Any
-import msgpack
 from eth_account import Account
-from eth_account.messages import encode_typed_data
-from eth_utils import keccak
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
@@ -233,73 +230,6 @@ class HIP3OpenInterestCapManager:
         logger.info(f"Built setOpenInterestCaps action for {asset} on DEX {dex}: ${cap_int:,}")
         return action
 
-    def action_hash(self, action: Dict, vault_address: Optional[str], nonce: int, expires_after: Optional[int]) -> bytes:
-        """
-        Create hash of the action for L1 signing.
-        
-        Args:
-            action: The action dictionary
-            vault_address: Vault address (None for master EOA)
-            nonce: Nonce timestamp
-            expires_after: Expiration timestamp (optional)
-            
-        Returns:
-            The action hash
-        """
-        data = msgpack.packb(action)
-        data += nonce.to_bytes(8, "big")
-        
-        if vault_address is not None:
-            data += bytes.fromhex(vault_address[2:] if vault_address.startswith("0x") else vault_address)
-            
-        if expires_after is not None:
-            data += expires_after.to_bytes(8, "big")
-            
-        return keccak(data)
-    
-    def construct_phantom_agent(self, hash: bytes) -> Dict:
-        """
-        Construct phantom agent for L1 signing.
-        Args:
-            hash: The action hash   
-        Returns:
-            Phantom agent dictionary
-        """
-        return {
-            "source": "a" if self.is_mainnet else "b",
-            "connectionId": "0x" + hash.hex(),  # hex string for bytes32
-        }
-    
-    def l1_payload(self, phantom_agent: Dict) -> Dict:
-        """
-        Create L1 payload for EIP-712 signing.
-        Args:
-            phantom_agent: The phantom agent dictionary    
-        Returns:
-            The L1 payload for signing
-        """
-        return {
-            "domain": {
-                "chainId": 1337,  # Critical: must be 1337 for L1 actions
-                "name": "Exchange",  # CRITICAL: Must be "Exchange" not "HyperliquidL1"
-                "version": "1",
-                "verifyingContract": "0x0000000000000000000000000000000000000000",
-            },
-            "types": {
-                "Agent": [
-                    {"name": "source", "type": "string"},
-                    {"name": "connectionId", "type": "bytes32"},
-                ],
-                "EIP712Domain": [
-                    {"name": "name", "type": "string"},
-                    {"name": "version", "type": "string"},
-                    {"name": "chainId", "type": "uint256"},
-                    {"name": "verifyingContract", "type": "address"},
-                ],
-            },
-            "primaryType": "Agent",
-            "message": phantom_agent,
-        }
     
     def sign_and_submit_l1_action(
         self,
@@ -430,30 +360,33 @@ class HIP3OpenInterestCapManager:
         if new_cap_decimal != new_cap_decimal.to_integral_value():
             raise ValueError("HIP-3 OI caps must be whole-dollar integers.")
         
-        # Optional: Validate DEX exists first (recommended for better error messages)
+        # MANDATORY: Validate DEX exists (CRASH ON FAILURE)
         if dex != "":  # Don't check for default DEX
-            try:
-                perp_dexs_resp = self.info.post("/info", {"type": "perpDexs"})
-                if isinstance(perp_dexs_resp, list):
-                    dex_names = []
-                    for entry in perp_dexs_resp:
-                        if isinstance(entry, dict):
-                            name = entry.get("name")
-                            if isinstance(name, str) and name != "":
-                                dex_names.append(name)
-                    if dex not in dex_names:
-                        logger.error(f"DEX '{dex}' not found. Available HIP-3 DEXs: {dex_names}")
-                        raise ValueError(f"DEX '{dex}' does not exist")
-            except Exception as e:
-                logger.warning(f"Could not validate DEX existence: {e}")
-                # Continue anyway as this is just a validation check
+            # Query perpDexs to validate DEX exists - MUST succeed
+            perp_dexs_resp = self.info.post("/info", {"type": "perpDexs"})
+            if not isinstance(perp_dexs_resp, list):
+                raise RuntimeError(f"❌ Invalid perpDexs response: {type(perp_dexs_resp)}")
+                
+            dex_names = []
+            for entry in perp_dexs_resp:
+                if entry is None:
+                    continue  # Skip null entries
+                if not isinstance(entry, dict):
+                    raise RuntimeError(f"❌ Invalid DEX entry in perpDexs: {type(entry)}")
+                name = entry.get("name")
+                if not isinstance(name, str) or name == "":
+                    continue  # Skip entries without valid names
+                dex_names.append(name)
+                
+            if dex not in dex_names:
+                logger.error(f"DEX '{dex}' not found. Available HIP-3 DEXs: {dex_names}")
+                raise ValueError(f"❌ DEX '{dex}' does not exist")
         
-        # Step 1: Read current DEX limits (contains OI caps)
+        # Step 1: Read current DEX limits (contains OI caps) - MUST succeed
         logger.info("Step 1: Reading current DEX limits and OI caps...")
-        try:
-            limits = self.get_dex_limits(dex)
-        except Exception as e:
-            raise ValueError(f"Failed to get DEX limits for {dex}: {e}")
+        limits = self.get_dex_limits(dex)
+        if not limits:
+            raise RuntimeError(f"❌ FAILED to get DEX limits for '{dex}' - null response")
         
         # Parse current caps from coinToOiCap array
         caps_map = {}
@@ -464,83 +397,122 @@ class HIP3OpenInterestCapManager:
         if asset not in caps_map:
             # Check if asset exists in the DEX universe (for first-time OI cap setting)
             logger.info(f"Asset {asset} not found in current OI caps. Checking DEX universe...")
-            try:
-                meta = self.get_meta(dex)
-                universe = meta.get("universe", [])
+            
+            meta = self.get_meta(dex)
+            if not meta:
+                raise RuntimeError(f"❌ FAILED to get meta for DEX '{dex}' during asset verification")
                 
-                asset_found_in_universe = False
-                for asset_info in universe:
-                    if isinstance(asset_info, dict) and asset_info.get("name") == asset:
-                        asset_found_in_universe = True
-                        break
-                
-                if not asset_found_in_universe:
-                    raise ValueError(f"Asset {asset} not found in DEX {dex}. Available assets: {list(caps_map.keys())}")
-                
-                # Asset exists in universe but no OI cap set yet - this is a first-time cap setting
-                logger.info(f"✅ Asset {asset} found in DEX universe - setting first OI cap")
-                current_cap = Decimal("0")  # No existing cap
-                
-            except Exception as e:
-                raise ValueError(f"Failed to verify asset {asset} in DEX {dex}: {e}")
+            universe = meta.get("universe", [])
+            if not universe:
+                raise RuntimeError(f"❌ DEX '{dex}' has no universe during asset verification")
+            
+            asset_found_in_universe = False
+            for asset_info in universe:
+                if not isinstance(asset_info, dict):
+                    raise RuntimeError(f"❌ Invalid asset info in universe - not a dict")
+                if asset_info.get("name") == asset:
+                    asset_found_in_universe = True
+                    break
+            
+            if not asset_found_in_universe:
+                universe_names = [a.get("name") for a in universe if isinstance(a, dict) and a.get("name")]
+                raise ValueError(f"❌ Asset '{asset}' not found in DEX '{dex}'. Available assets: {universe_names}")
+            
+            # Asset exists in universe but no OI cap set yet - this is a first-time cap setting
+            logger.info(f"✅ Asset {asset} found in DEX universe - setting first OI cap")
+            current_cap = Decimal("0")  # No existing cap
         else:
             current_cap = caps_map[asset]
         
-        # Step 2: Try to get current OI 
-        logger.info("Step 2: Fetching current open interest...")
+        # Step 2: MANDATORY - Get current OI (NO EXCEPTIONS)
+        logger.info("Step 2: Fetching current open interest (CRASH ON FAILURE)...")
         current_oi = None
         
-        # Since metaAndAssetCtxs doesn't support dex parameter in current SDK,
-        # we'll get meta for this DEX and check if it's the default DEX
-        try:
-            meta = self.get_meta(dex)
-            universe = meta.get("universe", [])
+        # MANDATORY: Get current OI data or DIE - no exceptions allowed
+        meta = self.get_meta(dex)
+        if not meta:
+            raise RuntimeError(f"❌ FAILED to get meta for DEX '{dex}' - cannot proceed")
             
-            # Check if this asset exists in this DEX
-            asset_found = False
-            for asset_info in universe:
-                if isinstance(asset_info, dict) and asset_info.get("name") == asset:
-                    asset_found = True
-                    break
+        universe = meta.get("universe", [])
+        if not universe:
+            raise RuntimeError(f"❌ DEX '{dex}' has no universe - invalid DEX")
+        
+        # Check if this asset exists in this DEX - must exist
+        asset_found = False
+        for asset_info in universe:
+            if isinstance(asset_info, dict) and asset_info.get("name") == asset:
+                asset_found = True
+                break
+        
+        if not asset_found:
+            raise ValueError(f"❌ Asset '{asset}' not found in DEX '{dex}' universe")
+        
+        # If this is the default DEX (empty string), we MUST get OI from metaAndAssetCtxs
+        if dex == "":
+            meta_and_ctxs = self.get_meta_and_asset_ctxs()
+            if meta_and_ctxs is None:
+                raise RuntimeError(f"❌ FAILED to get metaAndAssetCtxs for default DEX - cannot proceed")
+                
+            meta_default, contexts = meta_and_ctxs
+            universe_default = meta_default.get("universe", [])
             
-            if not asset_found:
-                raise ValueError(f"Asset {asset} not found in DEX {dex}")
+            if not universe_default:
+                raise RuntimeError(f"❌ Default DEX has no universe - corrupt data")
             
-            # If this is the default DEX (empty string), we can get OI from metaAndAssetCtxs
-            if dex == "":
-                meta_and_ctxs = self.get_meta_and_asset_ctxs()
-                if meta_and_ctxs is not None:
-                    meta_default, contexts = meta_and_ctxs
-                    universe_default = meta_default.get("universe", [])
+            if not contexts:
+                raise RuntimeError(f"❌ No asset contexts available - cannot get current OI")
+            
+            # Build name to index mapping
+            name_to_idx = {}
+            for i, asset_info in enumerate(universe_default):
+                if not isinstance(asset_info, dict):
+                    raise RuntimeError(f"❌ Invalid asset info at index {i} - not a dict")
+                asset_name = asset_info.get("name")
+                if not asset_name:
+                    raise RuntimeError(f"❌ Invalid asset info at index {i} - no name")
+                name_to_idx[asset_name] = i
                     
-                    # Build name to index mapping
-                    name_to_idx = {}
-                    for i, asset_info in enumerate(universe_default):
-                        if isinstance(asset_info, dict):
-                            name_to_idx[asset_info.get("name")] = i
-                            
-                    # Find the asset's context
-                    if asset in name_to_idx:
-                        idx = name_to_idx[asset]
-                        if idx < len(contexts):
-                            # openInterest is position size, need to multiply by markPx for USD notional
-                            oi_size_str = contexts[idx].get("openInterest", None)
-                            mark_px_str = contexts[idx].get("markPx", None)
-                            
-                            oi_size = Decimal(str(oi_size_str))
-                            mark_px = Decimal(str(mark_px_str))
-                            
-                            # Convert position size to USD notional
-                            current_oi = oi_size * mark_px
-                            logger.info(f"  OI size: {oi_size}, Mark price: ${mark_px}, USD notional: ${current_oi:,.2f}")
-            else:
-                # For HIP-3 DEXs, we can't get current OI from SDK
-                # This is a limitation of the current SDK
-                logger.warning(f"Cannot get current OI for HIP-3 DEX {dex} with current SDK")
-                logger.warning(f"Will rely on server-side validation of 0.5 * current OI constraint")
-        except Exception as e:
-            logger.warning(f"Could not fetch current OI: {e}")
-            logger.warning(f"Will rely on server-side validation")
+            # Find the asset's context - MUST exist
+            if asset not in name_to_idx:
+                raise RuntimeError(f"❌ Asset '{asset}' not found in default DEX context mapping")
+                
+            idx = name_to_idx[asset]
+            if idx >= len(contexts):
+                raise RuntimeError(f"❌ Asset index {idx} out of range (contexts length: {len(contexts)})")
+                
+            # Get OI data - MUST have valid data
+            asset_context = contexts[idx]
+            if not asset_context:
+                raise RuntimeError(f"❌ Null context for asset '{asset}' at index {idx}")
+                
+            oi_size_str = asset_context.get("openInterest")
+            mark_px_str = asset_context.get("markPx")
+            
+            if oi_size_str is None:
+                raise RuntimeError(f"❌ No openInterest data for '{asset}' - cannot proceed")
+            if mark_px_str is None:
+                raise RuntimeError(f"❌ No markPx data for '{asset}' - cannot proceed")
+            
+            # Convert to USD notional - MUST be valid numbers
+            try:
+                oi_size = Decimal(str(oi_size_str))
+                mark_px = Decimal(str(mark_px_str))
+            except Exception as e:
+                raise RuntimeError(f"❌ Invalid numeric data: OI='{oi_size_str}', markPx='{mark_px_str}' - {e}")
+            
+            if mark_px <= 0:
+                raise RuntimeError(f"❌ Invalid mark price: ${mark_px} - must be > 0")
+            
+            # Convert position size to USD notional
+            current_oi = oi_size * mark_px
+            logger.info(f"  ✅ OI size: {oi_size}, Mark price: ${mark_px}, USD notional: ${current_oi:,.2f}")
+        else:
+            # For HIP-3 builder DEXs, metaAndAssetCtxs cannot scope by dex; rely on server-side constraint checks
+            logger.warning(
+                f"Cannot get current OI for HIP-3 DEX '{dex}' with current SDK; "
+                "proceeding with server-side validation of the 0.5× OI constraint."
+            )
+            current_oi = None
         
         logger.info(f"  Asset: {asset}")
         if current_oi is not None:
@@ -567,7 +539,7 @@ class HIP3OpenInterestCapManager:
                     f"❌ SAFETY CHECK FAILED: Cap change of {cap_change_percent:.1f}% exceeds maximum allowed {self.max_cap_change_percent}%\n"
                     f"   Current cap: ${current_cap:,.0f}\n"
                     f"   New cap: ${new_cap_decimal:,.0f}\n"
-                    f"   To override, set HIP3_MAX_CAP_CHANGE_PERCENT environment variable"
+                    f"   To override, set HIP3_MAX_CAP_CHANGE_PERCENT={max(cap_change_percent + 10, 500):.0f}"
                 )
         
         # Step 4: Validate the new cap against HIP-3 constraints
@@ -648,7 +620,7 @@ class HIP3OpenInterestCapManager:
 def main():
     """Main entry point for the HIP-3 OI Cap Manager."""
     # Load environment variables
-    DEX_NAME = os.getenv("HIP3_DEX_NAME", "")
+    DEX_NAME = os.getenv("HIP3_DEX_NAME")  # HIP-3 requires explicit dex name
     MARKET_NAME = os.getenv("HIP3_MARKET_NAME", "")
     NEW_CAP_FOR_MARKET = os.getenv("HIP3_NEW_CAP", "")
     PRIVATE_KEY = os.getenv("HIP3_DEPLOYER_PRIVATE_KEY", "")
@@ -662,17 +634,20 @@ def main():
         logger.error("❌ Please set HIP3_DEPLOYER_PRIVATE_KEY environment variable")
         sys.exit(1)
     
+    if not DEX_NAME:
+        logger.error("❌ Please set HIP3_DEX_NAME (HIP-3 requires a named DEX; empty string not allowed)")
+        sys.exit(1)
+    
+    if len(DEX_NAME) > 6:
+        logger.error(f"❌ HIP-3 DEX names must be ≤ 6 characters. Got: '{DEX_NAME}' ({len(DEX_NAME)} chars)")
+        sys.exit(1)
+    
     if not MARKET_NAME:
         logger.error("❌ Please set HIP3_MARKET_NAME environment variable")
         sys.exit(1)
         
     if not NEW_CAP_FOR_MARKET:
         logger.error("❌ Please set HIP3_NEW_CAP environment variable")
-        sys.exit(1)
-    
-    # Validate DEX name for HIP-3 DEXs (perpDexLimits requires non-empty dex)
-    if DEX_NAME != "" and len(DEX_NAME) > 6:
-        logger.error(f"❌ HIP-3 DEX names must be ≤ 6 characters. Got: '{DEX_NAME}' ({len(DEX_NAME)} chars)")
         sys.exit(1)
     
     try:
