@@ -1,0 +1,40 @@
+[project]
+name = "oi-caps"
+version = "1.0.0"
+description = "HIP-3 Open Interest Cap Management Tool for Hyperliquid"
+readme = "README.md"
+authors = [
+    { name = "Hyperliquid SDK Team" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    # Core Hyperliquid SDK from PyPI
+    "hyperliquid-python-sdk>=0.19.0",
+    # Ethereum utilities for signing
+    "eth-account>=0.8.0",
+    "eth-utils>=2.0.0",
+    # Message packing for action hashing
+    "msgpack>=1.0.0",
+    # Environment variable loading (optional but recommended)
+    "python-dotenv>=1.0.0",
+    # WebSocket client (required by hyperliquid SDK)
+    "websocket-client>=1.0.0",
+    # HTTP requests
+    "requests>=2.25.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hyperliquid-dex/hyperliquid-python-sdk"
+Repository = "https://github.com/hyperliquid-dex/hyperliquid-python-sdk"
+Documentation = "https://hyperliquid.gitbook.io/hyperliquid-docs/"
+
+[project.scripts]
+oi-caps = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
