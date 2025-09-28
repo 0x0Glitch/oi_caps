@@ -5,7 +5,7 @@ Uses deployer EOA for L1 action signing with proper constraint validation.
 
 CRITICAL SPECIFICATIONS (According to official docs):
 • OI caps are USD NOTIONAL values (position_size × mark_price)
-• Minimum constraint: max(1_000_000 = $1 USD, 50% of current OI)
+• Minimum constraint: max(1_000_000 microUSD = $1 USD, 50% of current OI)
 • SetOpenInterestCaps: Array<[asset_name, cap_usd_notional]> (alphabetically sorted)
 
 ENVIRONMENT VARIABLES:
@@ -16,7 +16,7 @@ ENVIRONMENT VARIABLES:
 • HIP3_NEW_CAP_RAW - New cap in microUSD units (e.g., 5000000000000 for $5M) [choose this OR _USD]
 • HIP3_DRY_RUN - "true" for validation only (default: "true")
 • HIP3_IS_MAINNET - "true" for mainnet, "false" for testnet
-• HIP3_MAX_CAP_CHANGE_PERCENT - Max % cap change allowed (default: 200)
+• HIP3_MAX_CAP_CHANGE_PERCENT - Max % cap change allowed (default: 5.0)
 • HIP3_ENFORCE_CAP_ABOVE_OI - Require cap ≥ current OI (default: true, stricter than spec)
 
 TECHNICAL DETAILS:
@@ -187,19 +187,16 @@ class HIP3OpenInterestCapManager:
         Returns:
             True if valid, raises exception otherwise
         """
-        # Optional safety check: New cap >= current OI (stricter than HIP-3 spec)
         if self.enforce_cap_above_oi and current_oi is not None and new_cap < current_oi:
             raise ValueError(
-                f"❌ SAFETY VIOLATION: New cap ${new_cap:,.0f} is less than current OI ${current_oi:,.0f}\n"
+                f"❌ SAFETY VIOLATION: New cap ${float(new_cap)/1_000_000:,.0f} is less than current OI ${float(current_oi)/1_000_000:,.0f}\n"
                 f"   This would immediately violate open positions!\n"
-                f"   New cap must be >= current OI: ${current_oi:,.0f}\n"
+                f"   New cap must be >= current OI: ${float(current_oi)/1_000_000:,.0f}\n"
                 f"   (This is stricter than HIP-3 spec - disable with HIP3_ENFORCE_CAP_ABOVE_OI=false)"
             )
         
-        # Minimum cap is 1,000,000 units = $1 USD 
-        # Hyperliquid uses microUSD representation (6 decimal places)
-        # So 1,000,000 microUSD = $1.00 USD
-        min_cap = Decimal("1000000")  # This represents $1.00 USD, not $1 million!
+        # Minimum cap is 1,000,000 microUSD = $1.00 USD
+        min_cap = Decimal("1000000")
         
         # If current OI is available, also check 0.5 * current_oi constraint
         if current_oi is not None:
@@ -211,8 +208,8 @@ class HIP3OpenInterestCapManager:
             if self.enforce_cap_above_oi and current_oi > min_cap:
                 min_cap = current_oi
                 
-            logger.info(f"  Current OI: ${current_oi:,.2f}, Half OI: ${half_oi:,.2f}")
-            logger.info(f"  Required minimum: ${min_cap:,.2f}")
+            logger.info(f"  Current OI: ${float(current_oi)/1_000_000:,.2f}, Half OI: ${float(half_oi)/1_000_000:,.2f}")
+            logger.info(f"  Required minimum: ${float(min_cap)/1_000_000:,.2f}")
         else:
             logger.warning(f"  Current OI unavailable for {asset}, using $1 minimum only")
             logger.warning(f"  Server will still enforce current OI constraint")
@@ -255,12 +252,8 @@ class HIP3OpenInterestCapManager:
             "setOpenInterestCaps": caps_list
         }
         
-        # Show USD amount in log for clarity
         cap_usd = cap_int / 1000000
-        logger.info(f"Built setOpenInterestCaps action for {asset} on DEX {dex}: ${cap_usd:,.0f} (${cap_int:,} microUSD)")
-        
-        # Log the actual action structure for debugging
-        logger.info(f"Action structure: {json.dumps(action, indent=2)}")
+        logger.info(f"Built setOpenInterestCaps action for {asset} on DEX {dex}: ${cap_usd:,.0f}")
         return action
 
     
@@ -299,7 +292,6 @@ class HIP3OpenInterestCapManager:
             "signature": signature,
             "expiresAfter": expires_after
         }
-        # Note: vaultAddress omitted since active_pool is None
         
         # Submit to exchange endpoint
         try:
@@ -323,11 +315,8 @@ class HIP3OpenInterestCapManager:
             logger.error(f"Error message: {e}")
             logger.error(f"This suggests a payload format issue - the server cannot parse the JSON")
             
-            # Check if it's the common JSON deserialization error
             if "Failed to deserialize the JSON body" in str(e):
                 logger.error("💡 Server cannot parse the payload JSON structure")
-                logger.error("💡 This usually means a field type or structure mismatch")
-                logger.error("💡 Common issues: wrong data types, missing required fields, extra fields")
             
             # Re-raise the original exception
             raise
@@ -359,18 +348,11 @@ class HIP3OpenInterestCapManager:
             "signature": signature
         }
         
-        # Only include vaultAddress and expiresAfter if they are not None
-        # Normalize vault_address to lowercase for consistent signing
         if vault_address is not None:
             payload["vaultAddress"] = self.normalize_address(vault_address)
         if expires_after is not None:
             payload["expiresAfter"] = expires_after
         
-        # Don't log sensitive signature data but show payload structure for debugging
-        safe_payload = payload.copy()
-        if "signature" in safe_payload:
-            safe_payload["signature"] = {"r": "0x...", "s": "0x...", "v": "..."}
-        logger.info(f"Payload structure (masked): {json.dumps(safe_payload, indent=2)}")
         
         logger.info(f"Submitting action to exchange...")
         
@@ -384,7 +366,7 @@ class HIP3OpenInterestCapManager:
                 logger.error("💡 Hint: Check signing scheme (L1 vs user-signed) and payload field order")
                 logger.error("   See: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing")
             if "constraint" in str(response).lower() or "cap" in str(response).lower():
-                logger.error("💡 Hint: OI cap must be >= max($1M, 0.5 * current OI)")
+                logger.error("💡 Hint: OI cap must be >= max($1, 0.5 * current OI)")
             
         return response
     
@@ -407,19 +389,14 @@ class HIP3OpenInterestCapManager:
         """
         logger.info(f"{'[DRY RUN] ' if dry_run else ''}Changing OI cap for {asset} on DEX: {dex}")
         
-        # Handle new_cap input (already Decimal from main, but support legacy usage)
         new_cap_decimal = new_cap if isinstance(new_cap, Decimal) else Decimal(str(new_cap).replace("_", ""))
         
-        # Positivity check
         if new_cap_decimal <= 0:
             raise ValueError(f"❌ New cap must be positive, got: ${new_cap_decimal}")
         
-        # Enforce integral notional to avoid silent truncation
         if new_cap_decimal != new_cap_decimal.to_integral_value():
-            raise ValueError("HIP-3 OI caps must be whole-dollar integers.")
+            raise ValueError("HIP-3 OI caps must be integer microUSD values (no fractional micro-units).")
         
-        # MANDATORY: Validate DEX exists (CRASH ON FAILURE)
-        # Note: We require non-empty dex since HIP-3 requires named DEXs
         perp_dexs_resp = self.info.post("/info", {"type": "perpDexs"})
         if not isinstance(perp_dexs_resp, list):
             raise RuntimeError(f"❌ Invalid perpDexs response: {type(perp_dexs_resp)}")
@@ -427,12 +404,12 @@ class HIP3OpenInterestCapManager:
         dex_names = []
         for entry in perp_dexs_resp:
             if entry is None:
-                continue  # Skip null entries
+                continue
             if not isinstance(entry, dict):
                 raise RuntimeError(f"❌ Invalid DEX entry in perpDexs: {type(entry)}")
             name = entry.get("name")
             if not isinstance(name, str) or name == "":
-                continue  # Skip entries without valid names
+                continue
             dex_names.append(name)
             
         if dex not in dex_names:
@@ -445,14 +422,12 @@ class HIP3OpenInterestCapManager:
         if not limits:
             raise RuntimeError(f"❌ FAILED to get DEX limits for '{dex}' - null response")
         
-        # Parse current caps from coinToOiCap array
         caps_map = {}
         coin_to_oi_cap = limits.get("coinToOiCap", [])
         for coin, cap_str in coin_to_oi_cap:
             caps_map[coin] = Decimal(str(cap_str))
         
         if asset not in caps_map:
-            # Check if asset exists in the DEX universe (for first-time OI cap setting)
             logger.info(f"Asset {asset} not found in current OI caps. Checking DEX universe...")
             
             meta = self.get_meta(dex)
@@ -475,17 +450,15 @@ class HIP3OpenInterestCapManager:
                 universe_names = [a.get("name") for a in universe if isinstance(a, dict) and a.get("name")]
                 raise ValueError(f"❌ Asset '{asset}' not found in DEX '{dex}'. Available assets: {universe_names}")
             
-            # Asset exists in universe but no OI cap set yet - this is a first-time cap setting
             logger.info(f"✅ Asset {asset} found in DEX universe - setting first OI cap")
-            current_cap = Decimal("0")  # No existing cap
+            current_cap = Decimal("0")
         else:
             current_cap = caps_map[asset]
         
-        # Step 2: MANDATORY - Get current OI (NO EXCEPTIONS)
+        # Step 2: Get current OI
         logger.info("Step 2: Fetching current open interest (CRASH ON FAILURE)...")
         current_oi = None
         
-        # MANDATORY: Get current OI data or DIE - no exceptions allowed
         meta = self.get_meta(dex)
         if not meta:
             raise RuntimeError(f"❌ FAILED to get meta for DEX '{dex}' - cannot proceed")
@@ -494,7 +467,6 @@ class HIP3OpenInterestCapManager:
         if not universe:
             raise RuntimeError(f"❌ DEX '{dex}' has no universe - invalid DEX")
         
-        # Check if this asset exists in this DEX - must exist
         asset_found = False
         for asset_info in universe:
             if isinstance(asset_info, dict) and asset_info.get("name") == asset:
@@ -504,8 +476,6 @@ class HIP3OpenInterestCapManager:
         if not asset_found:
             raise ValueError(f"❌ Asset '{asset}' not found in DEX '{dex}' universe")
         
-        # For HIP-3 builder DEXs, metaAndAssetCtxs cannot scope by dex; rely on server-side constraint checks
-        # Note: Since we require non-empty DEX names, we always fall into this branch
         logger.warning(
             f"Cannot get current OI for HIP-3 DEX '{dex}' with current SDK; "
             "proceeding with server-side validation of the 0.5× OI constraint."
@@ -521,8 +491,7 @@ class HIP3OpenInterestCapManager:
         if current_cap == Decimal("0"):
             logger.info(f"  Current Cap: Not set (first-time cap setting)")
         else:
-            logger.info(f"  Current Cap: ${current_cap:,.2f}")
-        # Show cap in USD, not microUSD units
+            logger.info(f"  Current Cap: ${float(current_cap)/1_000_000:,.2f}")
         usd_amount = new_cap_decimal / Decimal("1000000")
         logger.info(f"  New Cap: ${usd_amount:,.2f}")
         
@@ -532,10 +501,8 @@ class HIP3OpenInterestCapManager:
             cap_change_percent = abs((new_cap_decimal - current_cap) / current_cap * 100)
             logger.info(f"  Cap change: {cap_change_percent:.1f}%")
             
-            # Convert max_cap_change_percent to Decimal for comparison
             max_change_decimal = Decimal(str(self.max_cap_change_percent))
             if cap_change_percent > max_change_decimal:
-                # Convert to USD for display
                 current_usd = current_cap / Decimal("1000000")
                 new_usd = new_cap_decimal / Decimal("1000000")
                 raise ValueError(
@@ -555,9 +522,9 @@ class HIP3OpenInterestCapManager:
                 "status": "dry_run_success",
                 "dex": dex,
                 "asset": asset,
-                "current_cap": float(current_cap / Decimal("1000000")),  # Convert to USD
-                "new_cap": float(new_cap_decimal / Decimal("1000000")),  # Convert to USD
-                "current_oi": float(current_oi / Decimal("1000000")) if current_oi else None  # Convert to USD
+                "current_cap": float(current_cap / Decimal("1000000")),
+                "new_cap": float(new_cap_decimal / Decimal("1000000")),
+                "current_oi": float(current_oi / Decimal("1000000")) if current_oi else None
             }
         
         # Step 5: Build action
@@ -579,7 +546,6 @@ class HIP3OpenInterestCapManager:
             time.sleep(2)  # Wait for state update
             
             try:
-                # Re-fetch DEX limits to verify the change
                 new_limits = self.get_dex_limits(dex)
                 new_caps_map = {}
                 new_coin_to_oi_cap = new_limits.get("coinToOiCap", [])
@@ -589,7 +555,6 @@ class HIP3OpenInterestCapManager:
                 
                 if asset in new_caps_map:
                     actual_cap = new_caps_map[asset]
-                    # Check if the cap was updated correctly (allow small rounding difference)
                     if abs(actual_cap - new_cap_decimal) < Decimal("1"):
                         actual_usd = actual_cap / Decimal("1000000")
                         logger.info(f"  ✅ {asset}: Cap successfully updated to ${actual_usd:,.2f}")
@@ -597,8 +562,8 @@ class HIP3OpenInterestCapManager:
                             "status": "success",
                             "dex": dex,
                             "asset": asset,
-                            "old_cap": float(current_cap / Decimal("1000000")),  # Convert to USD
-                            "new_cap": float(actual_cap / Decimal("1000000")),   # Convert to USD
+                            "old_cap": float(current_cap / Decimal("1000000")),
+                            "new_cap": float(actual_cap / Decimal("1000000")),
                             "response": response
                         }
                     else:
@@ -625,8 +590,7 @@ class HIP3OpenInterestCapManager:
 
 def main():
     """Main entry point for the HIP-3 OI Cap Manager."""
-    # Load environment variables
-    DEX_NAME = os.getenv("HIP3_DEX_NAME")  # HIP-3 requires explicit dex name
+    DEX_NAME = os.getenv("HIP3_DEX_NAME")
     MARKET_NAME = os.getenv("HIP3_MARKET_NAME", "")
     NEW_CAP_USD = os.getenv("HIP3_NEW_CAP_USD", "")
     NEW_CAP_RAW = os.getenv("HIP3_NEW_CAP_RAW", "")
@@ -665,15 +629,12 @@ def main():
         sys.exit(1)
     
     try:
-        # Parse the cap value based on which option was provided
         if NEW_CAP_USD:
-            # Convert USD to microUSD units (multiply by 1,000,000)
             cleaned_cap = NEW_CAP_USD.replace("_", "").replace(",", "")
             usd_amount = Decimal(cleaned_cap)
-            new_cap = usd_amount * Decimal("1000000")  # Convert to microUSD
+            new_cap = usd_amount * Decimal("1000000")
             logger.info(f"Using USD input: ${usd_amount:,.0f} = {new_cap:,.0f} microUSD units")
         else:
-            # Use raw microUSD units directly
             cleaned_cap = NEW_CAP_RAW.replace("_", "").replace(",", "")
             new_cap = Decimal(cleaned_cap)
             usd_equivalent = new_cap / Decimal("1000000")
@@ -702,9 +663,8 @@ def main():
     logger.info(f"DEX: {DEX_NAME}")
     logger.info(f"Asset: {MARKET_NAME}")
     
-    # Show cap in user-friendly format
     usd_amount = new_cap / Decimal("1000000")
-    logger.info(f"New Cap: ${usd_amount:,.0f} ({new_cap:,.0f} microUSD units)")
+    logger.info(f"New Cap: ${usd_amount:,.0f} ({int(new_cap):,} microUSD units) with expiresAfter=120s")
     logger.info(f"Mode: {'DRY RUN' if IS_DRY_RUN else 'LIVE EXECUTION'}")
     
     # Execute the operation
